@@ -1,16 +1,22 @@
 use std::{
-    fs::{File, OpenOptions},
-    os::unix::prelude::AsRawFd,
-    path::PathBuf,
-    str::FromStr,
+    alloc::Layout, fs::OpenOptions, os::unix::prelude::AsRawFd, path::PathBuf, str::FromStr,
 };
 
 use color_eyre::{
-    eyre::{bail, Result},
+    eyre::{bail, eyre, Context, Result},
     Report,
 };
-use nix::{request_code_none, sys::ioctl::ioctl_num_type};
+use nix::{errno::Errno, request_code_none, request_code_read, sys::ioctl::ioctl_num_type};
 use structopt::StructOpt;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
+
+fn main() -> Result<()> {
+    setup()?;
+    let options = Options::from_args();
+    run_command(&options)?;
+    Ok(())
+}
 
 #[derive(Debug, StructOpt, PartialEq, Eq, Clone, Copy)]
 enum Type {
@@ -49,33 +55,90 @@ struct Options {
     seq_no: ioctl_num_type,
     #[structopt(short, long)]
     r#type: Option<Type>,
+    #[structopt(long)]
+    align: Option<usize>,
+    #[structopt(long)]
+    size: Option<usize>,
 }
 
-fn main() -> Result<()> {
-    let options = Options::from_args();
+impl Options {
+    fn layout(&self) -> Result<Layout> {
+        let size = self
+            .size
+            .ok_or_else(|| eyre!("missing '--size' argument."))?;
+        let align = self
+            .align
+            .ok_or_else(|| eyre!("missing '--align' argument."))?;
+        Ok(Layout::from_size_align(size, align)?)
+    }
+}
+
+fn setup() -> Result<()> {
+    if std::env::var("RUST_BACKTRACE").is_err() {
+        std::env::set_var("RUST_BACKTRACE", "full");
+    }
+
+    if std::env::var("RUST_LIB_BACKTRACE").is_err() {
+        std::env::set_var("RUST_LIB_BACKTRACE", "1");
+    }
+    color_eyre::install()?;
+
+    if std::env::var("RUST_LOG").is_err() {
+        std::env::set_var("RUST_LOG", "info");
+    }
+    tracing_subscriber::fmt::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
+    Ok(())
+}
+
+fn run_command(options: &Options) -> Result<()> {
     let file = OpenOptions::new()
         .read(options.read)
         .write(options.write)
-        .open(&options.file)?;
+        .open(&options.file)
+        .map_err(|e| eyre!(e))
+        .wrap_err_with(|| format!("Couldn't open {:?}", &options.file))?;
     let fd = file.as_raw_fd();
     match (options.read, options.write) {
         (false, false) => match options.r#type {
             None | Some(Type::None) => {
-                let result = unsafe {
-                    nix::errno::Errno::result(libc::ioctl(
+                let result = Errno::result(unsafe {libc::ioctl(
                         fd,
                         request_code_none!(options.ioctl_id, options.seq_no),
-                    ))?
-                };
+                    )})?;
+                info!(%result);
                 return Ok(());
             }
             Some(other) => bail!(
-                "invalid type {:?} for a no-read, no-write ioctl: must be 'none' or unspecified.",
+                "invalid type {:?} for a no-read, no-write ioctl: must be 'none' (defaults to 'none' if unspecified).",
                 other
             ),
         },
-        (true, false) => match options.r#type {
-            None | Some(Type::Ptr) =>
+        (true, false) => {
+            let layout = options
+                .layout()
+                .wrap_err_with(|| "Must provide '--size' and '--align' when reading.")?;
+            match options.r#type {
+                None | Some(Type::Ptr) => {
+                    let mut data = vec![0u8; layout.size() + layout.align()];
+                    let offset = data.as_ptr().align_offset(layout.align());
+                    let result = {
+                        let data = data.as_mut_ptr();
+                        let data = data.wrapping_add(offset);
+                        Errno::result(unsafe {
+                            libc::ioctl(fd, request_code_read!(options.ioctl_id, options.seq_no, layout.size()), data)
+                        })?
+                    };
+                    info!(%result);
+                },
+                Some(Type::Buf) => unimplemented!(),
+                Some(other) => bail!(
+                    "invalid type {:?} for a read, no-write ioctl: must be 'ptr' or 'buf' (defaults to 'ptr' if unspecified).",
+                    other
+                ),
+            }
         }
         _ => unimplemented!(),
     }
